@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":[10],\"data_type\":\"int8\",\"chunk_grid\":{\"name\":\"rectilinear\",\"configuration\":{\"kind\":\"inline\",\"chunk_shapes\":[[3,3]]}},\"chunk_key_encoding\":{\"name\":\"default\"},\"fill_value\":0,\"codecs\":[{\"name\":\"bytes\"}]}")

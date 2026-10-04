@@ -1,0 +1,9 @@
+# The Python environment the consistency tests compare against.
+#   python3.12 -m venv .venv && .venv/bin/pip install -r consistency/requirements.txt
+zarr==3.4.0
+numcodecs==0.17.0
+numpy==2.5.3
+ml_dtypes==0.6.0
+cast-value-rs==0.4.2
+tensorstore==0.1.85
+google-crc32c==1.9.0
