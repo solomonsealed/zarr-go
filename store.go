@@ -241,18 +241,36 @@ type storeChunks struct {
 	enc   ChunkKeyEncoding
 }
 
-func (s storeChunks) key(coords []uint64) string { return joinKey(s.path, s.enc.Key(coords)) }
+func (s storeChunks) key(coords []uint64) (string, error) {
+	k := s.enc.Key(coords)
+	if k == "" {
+		return "", fmt.Errorf("zarr: chunk key encoding %q has no key for chunk %v", s.enc.Name, coords)
+	}
+	return joinKey(s.path, k), nil
+}
 
 func (s storeChunks) GetChunk(ctx context.Context, coords []uint64, r ByteRange) ([]byte, bool, error) {
-	return s.store.Get(ctx, s.key(coords), r)
+	k, err := s.key(coords)
+	if err != nil {
+		return nil, false, err
+	}
+	return s.store.Get(ctx, k, r)
 }
 
 type writableStoreChunks struct{ storeChunks }
 
 func (s writableStoreChunks) SetChunk(ctx context.Context, coords []uint64, data []byte) error {
-	return s.store.(WritableStore).Set(ctx, s.key(coords), data)
+	k, err := s.key(coords)
+	if err != nil {
+		return err
+	}
+	return s.store.(WritableStore).Set(ctx, k, data)
 }
 
 func (s writableStoreChunks) DeleteChunk(ctx context.Context, coords []uint64) error {
-	return s.store.(WritableStore).Delete(ctx, s.key(coords))
+	k, err := s.key(coords)
+	if err != nil {
+		return err
+	}
+	return s.store.(WritableStore).Delete(ctx, k)
 }

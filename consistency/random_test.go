@@ -128,7 +128,52 @@ func randomCase(rng *rand.Rand) Case {
 		c.WriteEmptyChunks = true
 		parts = append(parts, "write-empty")
 	}
+	if nd > 0 && rng.Intn(6) == 0 {
+		c.ChunkKeyEncoding = raw(randomTemplate(rng, nd))
+		parts = append(parts, "template")
+	}
 	return named(c, parts)
+}
+
+// randomTemplate returns a template chunk key encoding for nd dimensions:
+// some coordinates named by index (positive or negative), the others by
+// {*}, with optional zero padding. Literals separate the expressions, so
+// keys are unambiguous.
+func randomTemplate(rng *rand.Rand, nd int) string {
+	pad := func() string {
+		if rng.Intn(3) == 0 {
+			return fmt.Sprintf(":0%d", 1+rng.Intn(4))
+		}
+		return ""
+	}
+	perm := rng.Perm(nd)
+	named := rng.Intn(nd + 1)
+	var exprs []string
+	for _, d := range perm[:named] {
+		i := d
+		if rng.Intn(2) == 0 {
+			i = d - nd
+		}
+		exprs = append(exprs, fmt.Sprintf("{%d%s}", i, pad()))
+	}
+	cfg := map[string]string{}
+	if named < nd {
+		at := rng.Intn(len(exprs) + 1)
+		exprs = append(exprs[:at], append([]string{"{*" + pad() + "}"}, exprs[at:]...)...)
+		cfg["separator"] = pick(rng, "/", ".", "_", "-")
+	}
+	var b strings.Builder
+	b.WriteString(pick(rng, "", "c/", "chunks.", "k-"))
+	for i, e := range exprs {
+		if i > 0 {
+			b.WriteString(pick(rng, "/", ".", "_", "-x"))
+		}
+		b.WriteString(e)
+	}
+	b.WriteString(pick(rng, "", ".bin", "_end"))
+	cfg["format"] = b.String()
+	out, _ := json.Marshal(map[string]any{"name": "template", "configuration": cfg})
+	return string(out)
 }
 
 func named(c Case, parts []string) Case {

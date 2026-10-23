@@ -6,10 +6,10 @@ zarr-extensions ones, sharding with partial reads and writes, and NumPy-style
 selections. It has no cgo, and builds for `GOOS=js GOARCH=wasm` and
 `wasip1`.
 
-It is checked against zarr-python, both ways: the same operations through
-both implementations produce byte-identical metadata, the same stored keys,
-byte-identical chunks wherever the codecs are deterministic, and the same
-values on read. See [consistency](consistency/README.md).
+It is checked against zarr-python (3.4.1), both ways: the same operations
+through both implementations produce byte-identical metadata, the same
+stored keys, byte-identical chunks wherever the codecs are deterministic,
+and the same values on read. See [consistency](consistency/README.md).
 
 ```sh
 go get github.com/solomonsealed/zarr-go
@@ -101,11 +101,28 @@ rewritten; chunks that end up holding only the fill value are deleted (or
 kept, with `Options.WriteEmptyChunks`); `Resize` and `Append` delete chunks
 outside the new shape.
 
-**Chunk grids.** Regular and rectilinear (variable chunk sizes).
+**Chunk grids and keys.** Regular and rectilinear (variable chunk sizes)
+grids. The `default` and `v2` chunk key encodings, and the zarr-extensions
+[`template`](https://github.com/zarr-developers/zarr-extensions/tree/main/chunk-key-encodings/template)
+encoding, which builds keys from a template such as `"{-1}/{*:03}.tif"`
+(`ChunkKeyEncoding{Name: "template", Template: ..., Separator: "_"}`).
+
+**Metadata other programs wrote.** Invalid metadata that zarr-python 3.4.1
+reads leniently is read the same way: chunk sizes stored as 0 or `false` (by
+zarr-python 2.18–3.3 for arrays with a zero-length axis) as 1, or the inner
+chunk size when sharded; `true` as 1; float rectilinear edges as integers;
+and "regular" grids listing chunk edges as rectilinear. When a repair moves
+chunks, `Metadata.RepairPending` reports it, and the array stores the
+repaired metadata before its first write. Zarr v2 dtypes such as `"<u1"`
+(netCDF-C, Zarr.jl, jzarr) are read and written back as `"|u1"`, as
+zarr-python does.
 
 **Hierarchies.** `CreateGroup`, `OpenGroup`, `Group.Members`, `Walk`,
-attributes, and consolidated metadata in both zarr-python formats
-(`ConsolidateMetadata`; opening a group uses it automatically).
+attributes, extra fields of Zarr v3 groups (objects with
+`"must_understand": false`, kept and written back), and consolidated
+metadata in both zarr-python formats (`ConsolidateMetadata`; opening a group
+uses it automatically). Creating a node over an existing one with
+`Overwrite` validates the new node before deleting the old one.
 
 **Stores.** `MemoryStore`, `LocalStore` (zarr-python's directory layout,
 atomic writes), `ZipStore`, and `FSStore` for any `io/fs.FS` such as
@@ -142,7 +159,14 @@ Icechunk repositories.
   byte-identical with zarr-python's.
 - The numcodecs `pcodec` and `zfpy` codecs, and v2 object codecs other than
   `vlen-utf8`/`vlen-bytes` (`json2`, `msgpack2`, `pickle`, `vlen-array`), are
-  not built in; `RegisterCodec` can add them.
+  not built in; `RegisterCodec` can add them. (numcodecs 0.17.1 refuses to
+  decode `pickle` by default, as it can run arbitrary code.)
+- Zarr v3 metadata is written back as it was stored, with the changes made
+  to it and the normalizations zarr-python 3.4.1 applies to the fill value,
+  `μs` time units and rectilinear grids; zarr-python re-renders all of it,
+  so documents other programs wrote in another key order or with other codec
+  defaults may be rewritten differently. Zarr v2 `.zarray` documents are
+  rewritten as zarr-python writes them.
 - Concurrent writes to the same chunk are not coordinated, as in zarr-python.
 - Attributes written from Go maps have sorted keys.
 - `ZipStore` keeps written values in memory until `Close`.

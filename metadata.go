@@ -53,7 +53,21 @@ type Metadata struct {
 	// any extra fields, re-rendered when the metadata changes.
 	doc      jsonObject
 	rawAttrs any // ordered attributes as parsed
+	// stored is the document as stored when reading it needed a repair
+	// that moves chunks (see repair.go), until the repair is stored.
+	stored jsonObject
 }
+
+// RepairPending reports whether the metadata was read from an invalid
+// stored document whose repair moves chunks: a chunk size of 0 or false,
+// read as 1 (or the inner chunk size of a shard), or a "regular" grid
+// listing chunk edges, read as rectilinear. zarr-python 3.4.1 reads such
+// documents the same way. Chunks written under the repaired metadata are
+// not where readers of the stored document look for them, so the repaired
+// Document must be stored before chunks are written: arrays opened from a
+// Store do this on their first write; callers writing through NewArray's
+// ChunkWriter must do it themselves.
+func (m *Metadata) RepairPending() bool { return m.stored != nil }
 
 // ParseMetadata parses an array's zarr.json, or a Zarr v2 .zarray (whose
 // attributes then live in .zattrs; see ParseMetadataV2).
@@ -84,6 +98,32 @@ type rawV3 struct {
 	StorageTransformers []CodecSpec     `json:"storage_transformers"`
 }
 
+// orderedDocument parses an array metadata document keeping key order,
+// and applies the repairs of invalid documents (see repair.go). If a
+// repair changed it, repaired is the re-rendered document (else nil), and
+// stored is the document as stored if the repair moves chunks.
+func orderedDocument(doc []byte, format int) (ordered jsonObject, repaired []byte, stored jsonObject, err error) {
+	v, err := parseOrdered(doc)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	obj, ok := v.(jsonObject)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("not a JSON object")
+	}
+	fixed, changed, moves := repairArrayDocument(obj, format)
+	if !changed {
+		return obj, nil, nil, nil
+	}
+	if repaired, err = marshalPython(fixed, -1); err != nil {
+		return nil, nil, nil, err
+	}
+	if moves {
+		stored = obj
+	}
+	return fixed, repaired, stored, nil
+}
+
 func parseV3Metadata(doc []byte) (*Metadata, error) {
 	var raw rawV3
 	if err := json.Unmarshal(pyCompat(doc), &raw); err != nil {
@@ -98,9 +138,15 @@ func parseV3Metadata(doc []byte) (*Metadata, error) {
 	if len(raw.StorageTransformers) > 0 {
 		return nil, fmt.Errorf("%w: storage transformer %q", ErrUnsupported, raw.StorageTransformers[0].Name)
 	}
-	ordered, err := parseOrdered(doc)
+	ordered, repaired, stored, err := orderedDocument(doc, 3)
 	if err != nil {
 		return nil, fmt.Errorf("zarr: invalid zarr.json: %w", err)
+	}
+	if repaired != nil {
+		raw = rawV3{}
+		if err := json.Unmarshal(pyCompat(repaired), &raw); err != nil {
+			return nil, fmt.Errorf("zarr: invalid zarr.json: %w", err)
+		}
 	}
 	m := &Metadata{
 		ZarrFormat:     3,
@@ -109,7 +155,8 @@ func parseV3Metadata(doc []byte) (*Metadata, error) {
 		FillValue:      raw.FillValue,
 		Codecs:         raw.Codecs,
 		DimensionNames: raw.DimensionNames,
-		doc:            ordered.(jsonObject),
+		doc:            ordered,
+		stored:         stored,
 	}
 	// Extensions the reader must understand are refused.
 	for _, mem := range m.doc {
@@ -141,10 +188,19 @@ func parseV3Metadata(doc []byte) (*Metadata, error) {
 	if m.DataType, err = parseDataType(raw.DataType); err != nil {
 		return nil, err
 	}
+	if dt, ok := m.doc.get("data_type"); ok {
+		if canon, changed := canonicalTimeUnits(dt); changed {
+			m.doc.set("data_type", canon) // as zarr-python writes it back
+		}
+	}
 	if m.grid, m.ChunkShape, err = parseChunkGrid(raw.ChunkGrid, m.Shape); err != nil {
 		return nil, err
 	}
-	if m.ChunkKeyEncoding, err = parseChunkKeyEncoding(raw.ChunkKeyEncoding); err != nil {
+	if _, ok := m.grid.(*rectilinearGrid); ok {
+		// zarr-python writes rectilinear grids back in its run-length form.
+		m.doc.set("chunk_grid", m.grid.json())
+	}
+	if m.ChunkKeyEncoding, err = parseChunkKeyEncoding(raw.ChunkKeyEncoding, len(m.Shape)); err != nil {
 		return nil, err
 	}
 	if len(raw.FillValue) == 0 {
@@ -153,38 +209,68 @@ func parseV3Metadata(doc []byte) (*Metadata, error) {
 	if m.fill, err = parseFillValue(raw.FillValue, m.DataType); err != nil {
 		return nil, err
 	}
+	// zarr-python writes the fill value back from what it read ("NaT" as
+	// its integer, a struct's base64 bytes as an object of its fields).
+	m.doc.set("fill_value", fillJSON(m.DataType, m.fill, 3))
 	if len(m.Codecs) == 0 {
 		return nil, fmt.Errorf("zarr: zarr.json has no codecs")
 	}
 	return m, nil
 }
 
-func parseChunkKeyEncoding(raw json.RawMessage) (ChunkKeyEncoding, error) {
+func parseChunkKeyEncoding(raw json.RawMessage, ndim int) (ChunkKeyEncoding, error) {
 	if len(raw) == 0 {
 		return ChunkKeyEncoding{Name: "default", Separator: "/"}, nil
 	}
 	var e struct {
-		Name          string `json:"name"`
-		Configuration struct {
-			Separator string `json:"separator"`
-		} `json:"configuration"`
+		Name          string          `json:"name"`
+		Configuration json.RawMessage `json:"configuration"`
 	}
 	if json.Unmarshal(raw, &e.Name) != nil {
 		if err := json.Unmarshal(raw, &e); err != nil {
 			return ChunkKeyEncoding{}, fmt.Errorf("zarr: invalid chunk_key_encoding %s", raw)
 		}
 	}
+	var k ChunkKeyEncoding
 	switch e.Name {
 	case "default", "v2":
+		var cfg struct {
+			Separator string `json:"separator"`
+		}
+		if err := parseConfig(e.Configuration, &cfg); err != nil {
+			return k, fmt.Errorf("zarr: invalid chunk_key_encoding %s", raw)
+		}
+		k = ChunkKeyEncoding{Name: e.Name, Separator: cfg.Separator}
+		k.Separator = k.separator()
+	case "template":
+		var cfg map[string]json.RawMessage
+		if err := json.Unmarshal(e.Configuration, &cfg); err != nil || cfg == nil {
+			return k, fmt.Errorf("zarr: invalid chunk_key_encoding %s", raw)
+		}
+		k.Name = e.Name
+		for key, v := range cfg {
+			var err error
+			switch key {
+			case "format":
+				err = json.Unmarshal(v, &k.Template)
+			case "separator":
+				if string(v) != "null" {
+					err = json.Unmarshal(v, &k.Separator)
+				}
+			default:
+				err = fmt.Errorf("unknown field %q", key)
+			}
+			if err != nil {
+				return k, fmt.Errorf("zarr: invalid template chunk_key_encoding %s: %v", raw, err)
+			}
+		}
+		if _, ok := cfg["format"]; !ok {
+			return k, fmt.Errorf("zarr: template chunk_key_encoding without a format: %s", raw)
+		}
 	default:
 		return ChunkKeyEncoding{}, fmt.Errorf("%w: chunk key encoding %q", ErrUnsupported, e.Name)
 	}
-	k := ChunkKeyEncoding{Name: e.Name, Separator: e.Configuration.Separator}
-	k.Separator = k.separator()
-	if k.Separator != "/" && k.Separator != "." {
-		return k, fmt.Errorf("zarr: invalid chunk key separator %q", k.Separator)
-	}
-	return k, nil
+	return k, k.check(ndim)
 }
 
 // ParseMetadataV2 parses a Zarr v2 array: its .zarray document and its
@@ -201,17 +287,21 @@ func ParseMetadataV2(zarray, zattrs []byte) (*Metadata, error) {
 		Compressor         json.RawMessage   `json:"compressor"`
 		DimensionSeparator string            `json:"dimension_separator"`
 	}
+	// Repaired first: stored chunk sizes may be JSON booleans.
+	ordered, repaired, stored, err := orderedDocument(zarray, 2)
+	if err != nil {
+		return nil, fmt.Errorf("zarr: invalid .zarray: %w", err)
+	}
+	if repaired != nil {
+		zarray = repaired
+	}
 	if err := json.Unmarshal(zarray, &raw); err != nil {
 		return nil, fmt.Errorf("zarr: invalid .zarray: %w", err)
 	}
 	if raw.ZarrFormat != 2 {
 		return nil, fmt.Errorf("zarr: .zarray has zarr_format %d", raw.ZarrFormat)
 	}
-	ordered, err := parseOrdered(zarray)
-	if err != nil {
-		return nil, fmt.Errorf("zarr: invalid .zarray: %w", err)
-	}
-	m := &Metadata{ZarrFormat: 2, NodeType: "array", Shape: raw.Shape, ChunkShape: raw.Chunks, FillValue: raw.FillValue, Order: raw.Order, doc: ordered.(jsonObject)}
+	m := &Metadata{ZarrFormat: 2, NodeType: "array", Shape: raw.Shape, ChunkShape: raw.Chunks, FillValue: raw.FillValue, Order: raw.Order, doc: ordered, stored: stored}
 	if m.Shape == nil {
 		m.Shape = []uint64{}
 	}
@@ -289,6 +379,9 @@ func ParseMetadataV2(zarray, zattrs []byte) (*Metadata, error) {
 	if m.fill, err = parseV2Fill(raw.FillValue, m.DataType); err != nil {
 		return nil, err
 	}
+	if doc, err := m.v2Document(len(raw.FillValue) == 0 || string(raw.FillValue) == "null"); err == nil {
+		m.doc = doc
+	}
 	if zattrs != nil {
 		if m.Attributes, err = decodeAttributes(pyCompat(zattrs)); err != nil {
 			return nil, err
@@ -298,6 +391,49 @@ func ParseMetadataV2(zarray, zattrs []byte) (*Metadata, error) {
 		m.Attributes = map[string]any{}
 	}
 	return m, nil
+}
+
+// v2Document renders the .zarray as zarr-python writes back what it read
+// (ArrayV2Metadata.to_dict): its keys in order, unknown keys dropped, codec
+// configurations as numcodecs' get_config() gives them, and the dtype in
+// NumPy's spelling: "|" for single-byte and raw types stored with "<" or
+// ">" (as netCDF-C, Zarr.jl and jzarr write them), "us" for "μs".
+func (m *Metadata) v2Document(nullFill bool) (jsonObject, error) {
+	dt, err := m.DataType.v2JSON(m.BigEndian)
+	if err != nil {
+		return nil, err
+	}
+	var fill any
+	if !nullFill {
+		fill = fillJSON(m.DataType, m.fill, 2)
+	}
+	var filters any
+	if len(m.Filters) > 0 {
+		fs := make([]any, len(m.Filters))
+		for i, f := range m.Filters {
+			if fs[i], err = numcodecJSON(f); err != nil {
+				return nil, err
+			}
+		}
+		filters = fs
+	}
+	var compressor any
+	if m.Compressor != nil {
+		if compressor, err = numcodecJSON(*m.Compressor); err != nil {
+			return nil, err
+		}
+	}
+	return jsonObject{
+		{"shape", m.Shape},
+		{"chunks", m.ChunkShape},
+		{"dtype", dt},
+		{"fill_value", fill},
+		{"order", m.Order},
+		{"filters", filters},
+		{"dimension_separator", m.ChunkKeyEncoding.Separator},
+		{"compressor", compressor},
+		{"zarr_format", 2},
+	}, nil
 }
 
 func isObjectCodec(id string) bool {
@@ -561,3 +697,67 @@ func checkShape(shape []uint64) error {
 
 // FillValueArray returns the fill value as a 0-d array.
 func (m *Metadata) FillValueArray() *NDArray { return m.fill.ndarray(m.DataType) }
+
+// canonicalTimeUnits respells the microsecond unit "μs" as "us" in a Zarr
+// v3 data_type (including struct fields), as zarr-python writes it.
+func canonicalTimeUnits(v any) (any, bool) {
+	obj, ok := v.(jsonObject)
+	if !ok {
+		return v, false
+	}
+	name, _ := obj.get("name")
+	c, _ := obj.get("configuration")
+	cfg, ok := c.(jsonObject)
+	if !ok {
+		return v, false
+	}
+	switch name {
+	case "numpy.datetime64", "numpy.timedelta64":
+		if u, _ := cfg.get("unit"); u != "μs" {
+			return v, false
+		}
+		cfg = slices.Clone(cfg)
+		cfg.set("unit", "us")
+	case "struct", "structured":
+		f, _ := cfg.get("fields")
+		fields, ok := f.([]any)
+		if !ok {
+			return v, false
+		}
+		var out []any
+		for i, field := range fields {
+			var nf any
+			switch x := field.(type) {
+			case jsonObject:
+				dt, _ := x.get("data_type")
+				if ndt, changed := canonicalTimeUnits(dt); changed {
+					y := slices.Clone(x)
+					y.set("data_type", ndt)
+					nf = y
+				}
+			case []any:
+				if len(x) == 2 {
+					if ndt, changed := canonicalTimeUnits(x[1]); changed {
+						nf = []any{x[0], ndt}
+					}
+				}
+			}
+			if nf != nil {
+				if out == nil {
+					out = slices.Clone(fields)
+				}
+				out[i] = nf
+			}
+		}
+		if out == nil {
+			return v, false
+		}
+		cfg = slices.Clone(cfg)
+		cfg.set("fields", out)
+	default:
+		return v, false
+	}
+	obj = slices.Clone(obj)
+	obj.set("configuration", cfg)
+	return obj, true
+}

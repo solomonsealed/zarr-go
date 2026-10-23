@@ -199,9 +199,6 @@ func TestFixtures(t *testing.T) {
 					t.Fatalf("read %v: %v", r.Sel, err)
 				}
 				want, _ := fromWire(r.Result, dt)
-				if dt.Kind == zarr.KindBytes && len(got.Shape) == 0 {
-					got.Strings[0] = strings.TrimRight(got.Strings[0], "\x00")
-				}
 				if err := sameArray(want, got); err != nil {
 					t.Fatalf("read %v: %v", r.Sel, err)
 				}

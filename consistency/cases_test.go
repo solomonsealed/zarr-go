@@ -348,6 +348,11 @@ func gridCases() []Case {
 		{Name: "key-v2-slash", ZarrFormat: 3, Shape: []uint64{5, 5}, Chunks: []uint64{2, 2}, DataType: raw(`"int8"`), ChunkKeyEncoding: raw(`{"name": "v2", "configuration": {"separator": "/"}}`), Compressors: none},
 		{Name: "key-v2-dot", ZarrFormat: 3, Shape: []uint64{5, 5}, Chunks: []uint64{2, 2}, DataType: raw(`"int8"`), ChunkKeyEncoding: raw(`{"name": "v2", "configuration": {"separator": "."}}`), Compressors: none},
 		{Name: "v2-slash", ZarrFormat: 2, Shape: []uint64{5, 5}, Chunks: []uint64{2, 2}, DType: raw(`"<i4"`), ChunkKeyEncoding: raw(`{"name": "v2", "configuration": {"separator": "/"}}`), Compressors: none},
+		// The zarr-extensions template encoding (zarr-python via zarr-template).
+		{Name: "key-template", ZarrFormat: 3, Shape: []uint64{5, 6, 4}, Chunks: []uint64{2, 2, 3}, DataType: raw(`"int16"`), ChunkKeyEncoding: raw(`{"name": "template", "configuration": {"format": "{2}/c{0}_{1:02}.bin"}}`), Compressors: none},
+		{Name: "key-template-catchall", ZarrFormat: 3, Shape: []uint64{5, 6, 7}, Chunks: []uint64{2, 4, 3}, DataType: raw(`"float32"`), ChunkKeyEncoding: raw(`{"name": "template", "configuration": {"format": "data/{-1}/{*:03}", "separator": "."}}`)},
+		{Name: "key-template-braces", ZarrFormat: 3, Shape: []uint64{9}, Chunks: []uint64{2}, DataType: raw(`"uint8"`), ChunkKeyEncoding: raw(`{"name": "template", "configuration": {"format": "a{{b{*}}}c", "separator": "."}}`), Compressors: none},
+		{Name: "key-template-sharded", ZarrFormat: 3, Shape: []uint64{8, 8}, Chunks: []uint64{2, 2}, Shards: []uint64{4, 4}, DataType: raw(`"int32"`), ChunkKeyEncoding: raw(`{"name": "template", "configuration": {"format": "shard-{*}", "separator": "-"}}`), Compressors: none},
 	}
 	return cases
 }

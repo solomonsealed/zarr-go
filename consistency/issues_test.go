@@ -3,13 +3,16 @@ package consistency
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"math"
 	"testing"
 
 	zarr "github.com/solomonsealed/zarr-go"
 )
 
 // TestKnownPythonIssues reproduces the zarr-python 3.4 / numcodecs 0.17
-// issues the consistency tests ran into and work around, and checks that
+// (and zarr-template) issues the consistency tests ran into and work
+// around, and checks that
 // Go handles each case correctly. If an issue no longer occurs upstream,
 // the test fails so the workaround can be removed and the case covered.
 func TestKnownPythonIssues(t *testing.T) {
@@ -28,13 +31,31 @@ func TestKnownPythonIssues(t *testing.T) {
 				t.Fatalf("got %q", got.Strings[0])
 			}
 		}},
-		{"vlen_bytes_single_read", "reading one element of a variable_length_bytes array drops trailing NUL bytes", func(t *testing.T) {
-			a := newArray(t, zarr.ArraySpec{Shape: []uint64{2}, DataType: "variable_length_bytes"})
+		{"vlen_bytes_nested", "reading one element of a sharded variable_length_bytes array returns it inside nested 0-d object arrays", func(t *testing.T) {
+			a := newArray(t, zarr.ArraySpec{Shape: []uint64{2}, ChunkShape: []uint64{1}, ShardShape: []uint64{2}, DataType: "variable_length_bytes"})
 			v, _ := zarr.FromValues([]uint64{2}, a.DataType(), []string{"a\x00", "b"})
 			must(t, a.Set(ctx, v))
 			got, _ := a.Get(ctx, zarr.Index(0))
-			if got.Strings[0] != "a\x00" {
-				t.Fatalf("got %q", got.Strings[0])
+			if len(got.Shape) != 0 || got.Strings[0] != "a\x00" {
+				t.Fatalf("got %v %q", got.Shape, got.Strings)
+			}
+		}},
+		{"generic_time_big_endian", "chunks of a big-endian generic timedelta64 array (\">m8[2generic]\") that hold only NaT are stored instead of deleted", func(t *testing.T) {
+			s := zarr.NewMemoryStore()
+			a, err := zarr.CreateArray(ctx, s, "a", zarr.ArraySpec{ZarrFormat: 2, Shape: []uint64{4}, ChunkShape: []uint64{2}, DataType: ">m8[2generic]",
+				FillValue: json.RawMessage("null"), Compressors: []zarr.CodecSpec{}}, nil)
+			must(t, err)
+			v, _ := zarr.FromValues([]uint64{4}, a.DataType(), []int64{1, 2, math.MinInt64, math.MinInt64})
+			must(t, a.Set(ctx, v))
+			if _, ok, _ := s.Get(ctx, "a/1", zarr.ByteRange{}); ok {
+				t.Fatal("go stored a chunk holding only NaT")
+			}
+		}},
+		{"template_dimensions", "zarr-template 0.1.0 accepts a chunk key template that does not name every coordinate (\"{0}\" on a 2-d array), giving several chunks one key", func(t *testing.T) {
+			_, err := zarr.CreateArray(ctx, zarr.NewMemoryStore(), "a", zarr.ArraySpec{Shape: []uint64{2, 4}, ChunkShape: []uint64{1, 2}, DataType: "int8",
+				ChunkKeyEncoding: zarr.ChunkKeyEncoding{Name: "template", Template: "{0}"}}, nil)
+			if err == nil {
+				t.Fatal("go accepted the template")
 			}
 		}},
 		{"quantize_astype", "numcodecs.quantize with an astype other than its dtype cannot be read back (the v3 wrapper does not propagate the type)", func(t *testing.T) {

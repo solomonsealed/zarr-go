@@ -1,8 +1,9 @@
 # Consistency with zarr-python
 
 The tests in this directory check that this package and
-[zarr-python](https://github.com/zarr-developers/zarr-python) agree, in both
-directions, on everything they both support. They drive zarr-python through
+[zarr-python](https://github.com/zarr-developers/zarr-python) (3.4.1, with
+numcodecs 0.17.1; see `requirements.txt`) agree, in both directions, on
+everything they both support. They drive zarr-python through
 `oracle.py`, a small JSON-lines server, apply the same operations with both
 implementations, and require that:
 
@@ -30,14 +31,14 @@ ZARR_PYTHON=.venv/bin/python go test ./consistency/
 A run takes about a minute and ends with a summary line, e.g.
 
 ```
-consistency: 458 array cases, 7478 operations, 62383 comparisons (30632 chunks byte-identical, 11196 chunks decoded and compared), 507 operations both refused
+consistency: 506 array cases, 7704 operations, 63767 comparisons (31030 chunks byte-identical, 11540 chunks decoded and compared), 544 operations both refused
 ```
 
 `TestRandomCases` takes `-zarr.cases=N` and `-zarr.seed=S` for longer runs.
 
 Without `ZARR_PYTHON`, the live tests skip and `TestFixtures` and
 `TestHierarchyFixtures` check Go against recordings of zarr-python's stores
-and answers in `testdata/fixtures` (397 arrays and four hierarchies, about
+and answers in `testdata/fixtures` (401 arrays and four hierarchies, about
 2 MB). Re-record them after changing a case:
 
 ```sh
@@ -51,8 +52,10 @@ ZARR_PYTHON=.venv/bin/python go test ./consistency/ -run TestFixtures -zarr.reco
 | `TestDataTypesV3`, `TestDataTypesV2` | Every data type, with interesting fill values (NaN, -0.0, ±Infinity, int64 and uint64 extremes, NaT, non-ASCII strings, structs); v2 also in Fortran order, big-endian and with `null` fill values. |
 | `TestCodecsV3`, `TestCodecsV2` | Every codec as zarr-python's `create_array` takes it: `bytes` (both endians, structs, UTF-32), `transpose`, `gzip`, `zstd`, `crc32c`, `blosc` (all compressors and shuffles), the `numcodecs.*` compressors, checksums and filters, `scale_offset` and `cast_value`; in v2, numcodecs filters and compressors including `categorize`. |
 | `TestSharding` | Morton order of inner chunks, edge shards, `index_location`, custom index codecs, nested sharding, codecs outside sharding, `write_empty_chunks`, and partial shard writes. |
-| `TestGridsAndKeys`, `TestShapes` | Rectilinear grids, chunk key encodings, 0-d arrays, empty dimensions, chunks larger than the array, dimension names, attributes. |
+| `TestGridsAndKeys`, `TestShapes` | Rectilinear grids, chunk key encodings (including the zarr-extensions `template` encoding, through the zarr-template package), 0-d arrays, empty dimensions, chunks larger than the array, dimension names, attributes. |
 | `TestRandomCases` | Random combinations of all of the above. |
+| `TestStoredDocuments` | Metadata other programs stored, opened by both: the invalid chunk shapes zarr-python 3.4.1 repairs (sizes of 0, `false` and `true`, float edges, "regular" grids listing edges; written by zarr-python 2.18–3.3), v2 data types spelled with a byte order that does not apply (netCDF-C, Zarr.jl, jzarr), `μs` and scaled generic time units, extra fields, and documents both must refuse (invalid chunk sizes, compressed shard indexes, indivisible nested shards). Both must write back the same documents and agree after writes, resizes and attribute updates. |
+| `TestTruncatedShards`, `TestGroupExtraFields`, `TestConsolidatedRepairs` | Shards too short for their index are refused on every path; group extra fields are kept, written back and consolidated, or refused; consolidated metadata keeps a document as stored until its repair is stored. |
 | `TestHierarchy` | Groups, implicit parents, attributes and consolidated metadata (v2 and v3), and member listings. |
 | `TestCodecParity` | 201 codec configurations on buffers from 0 bytes to 300 KB: byte-identical output where deterministic, and each side decoding the other's output. |
 | `TestNarrowFloats` | bfloat16, float8, float6 and float4 conversions against ml_dtypes: every bit pattern decoded, and values around every representable number and halfway point encoded. |
@@ -65,8 +68,10 @@ The comparison works around these; Go handles each case correctly.
 
 - Writing a single element of a `variable_length_bytes` array raises
   `TypeError: Expected bytes, got numpy.ndarray`.
-- Reading a single element of a `variable_length_bytes` array returns a
-  NumPy `bytes_`, which drops trailing NUL bytes (`b"a\x00"` reads as `b"a"`).
+- Reading a single element of a sharded `variable_length_bytes` array
+  returns it inside nested 0-d object arrays.
+- Chunks of a big-endian generic `timedelta64` array (`">m8[2generic]"`)
+  that hold only NaT are stored instead of deleted.
 - `numcodecs.quantize` with an `astype` other than its `dtype` cannot be read
   back: the v3 wrapper does not pass the new type to the next codec.
 - `numcodecs.bitround` on Zarr v2 arrays with `order="F"` scrambles the data,
@@ -82,6 +87,13 @@ The comparison works around these; Go handles each case correctly.
   `out_of_range` is `clamp`. The tests use values away from those limits.
 - Writes with repeated integer indices have no defined winner: zarr-python
   orders them with an unstable `argsort`. The tests write unique indices.
+- zarr-template 0.1.0 accepts a template that does not name every chunk
+  coordinate (`"{0}"` on a 2-d array), so several chunks share a key; the
+  specification requires an error, which Go gives.
+
+zarr-python 3.4.1 fixed one issue listed for 3.4.0: reading a single
+element of a `variable_length_bytes` array no longer drops trailing NUL
+bytes.
 
 Two differences are by design: TensorStore orders inner chunks within a shard
 differently from zarr-python (the spec leaves the order open), so sharded
