@@ -119,25 +119,6 @@ func (g *rectilinearGrid) edges(dim int) []uint64 {
 	return out
 }
 
-// uniformEdge reports whether dimension d's explicit edges are all equal
-// and cover extent, which zarr-python handles as a regular dimension.
-func (g *rectilinearGrid) uniformEdge(d int, extent uint64) (uint64, bool) {
-	edges := g.edges(d)
-	if len(edges) == 0 {
-		return 0, false
-	}
-	for _, e := range edges {
-		if e != edges[0] {
-			return 0, false
-		}
-	}
-	sum := g.starts[d][len(g.starts[d])-1]
-	if sum == extent || uint64(len(edges)) == (extent+edges[0]-1)/edges[0] {
-		return edges[0], true
-	}
-	return 0, false
-}
-
 // json renders the grid as zarr-python does: bare ints for regular
 // dimensions, and edge lists run-length encoded when that is shorter.
 func (g *rectilinearGrid) json() any {
@@ -279,14 +260,22 @@ func parseChunkGrid(raw json.RawMessage, shape []uint64) (chunkGrid, []uint64, e
 
 // ChunkKeyEncoding maps chunk grid coordinates to store keys.
 type ChunkKeyEncoding struct {
-	// Name is "default" ("c/1/2") or "v2" ("1.2").
+	// Name is "default" ("c/1/2"), "v2" ("1.2") or "template" (the
+	// zarr-extensions encoding, e.g. "{-1}/{*}.tif"; Zarr v3).
 	Name string
-	// Separator is "/" or "."; empty means the encoding's default.
+	// Separator is "/" or "." for "default" and "v2"; empty means the
+	// encoding's default. For "template" it joins the coordinates of the
+	// {*} expression, which then requires it.
 	Separator string
+	// Template is the template string of the "template" encoding (stored
+	// as its configuration's "format"): {0} is the first chunk coordinate,
+	// {-1} the last, {*} every one not named elsewhere, ":0N" zero-pads to
+	// N digits ("{0:04}") and "{{" and "}}" are literal braces.
+	Template string
 }
 
 func (e ChunkKeyEncoding) separator() string {
-	if e.Separator != "" {
+	if e.Separator != "" || e.Name == "template" {
 		return e.Separator
 	}
 	if e.Name == "v2" {
@@ -295,8 +284,38 @@ func (e ChunkKeyEncoding) separator() string {
 	return "/"
 }
 
-// Key returns the key of the chunk at coords, relative to the array.
+// check reports whether the encoding is valid for arrays of ndim
+// dimensions.
+func (e ChunkKeyEncoding) check(ndim int) error {
+	switch e.Name {
+	case "default", "v2":
+		if s := e.separator(); s != "/" && s != "." {
+			return fmt.Errorf("zarr: invalid chunk key separator %q", s)
+		}
+		return nil
+	case "template":
+		t, err := parseKeyTemplate(e.Template)
+		if err != nil {
+			return err
+		}
+		_, _, err = t.layout(ndim, e.Separator)
+		return err
+	}
+	return fmt.Errorf("%w: chunk key encoding %q", ErrUnsupported, e.Name)
+}
+
+// Key returns the key of the chunk at coords, relative to the array. For
+// a template that does not suit len(coords) dimensions (which parsing an
+// array's metadata rules out) it returns "".
 func (e ChunkKeyEncoding) Key(coords []uint64) string {
+	if e.Name == "template" {
+		t, err := parseKeyTemplate(e.Template)
+		if err != nil {
+			return ""
+		}
+		k, _ := t.key(coords, e.Separator)
+		return k
+	}
 	parts := make([]string, len(coords))
 	for i, c := range coords {
 		parts[i] = strconv.FormatUint(c, 10)
@@ -313,6 +332,13 @@ func (e ChunkKeyEncoding) Key(coords []uint64) string {
 // Parse returns the chunk coordinates of a key, or false if the key is not
 // a chunk key of an array with ndim dimensions.
 func (e ChunkKeyEncoding) Parse(key string, ndim int) ([]uint64, bool) {
+	if e.Name == "template" {
+		t, err := parseKeyTemplate(e.Template)
+		if err != nil {
+			return nil, false
+		}
+		return t.parse(key, ndim, e.Separator)
+	}
 	var parts []string
 	if e.Name == "v2" {
 		if ndim == 0 {
@@ -340,6 +366,15 @@ func (e ChunkKeyEncoding) Parse(key string, ndim int) ([]uint64, bool) {
 	return out, true
 }
 
+// json renders the chunk_key_encoding entry of zarr.json (the template
+// encoding as the zarr-template package for zarr-python writes it).
 func (e ChunkKeyEncoding) json() any {
+	if e.Name == "template" {
+		cfg := jsonObject{{"format", e.Template}}
+		if e.Separator != "" {
+			cfg = append(cfg, jsonMember{"separator", e.Separator})
+		}
+		return jsonObject{{"name", e.Name}, {"configuration", cfg}}
+	}
 	return jsonObject{{"name", e.Name}, {"configuration", jsonObject{{"separator", e.separator()}}}}
 }

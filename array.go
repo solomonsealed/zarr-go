@@ -517,10 +517,8 @@ func (a *Array) blockOffset(d int, i, nc, dimLen int64) int64 {
 		if g.step[d] > 0 {
 			return i * int64(g.step[d])
 		}
-		// zarr-python treats identical edges as a fixed chunk size.
-		if e, ok := g.uniformEdge(d, uint64(dimLen)); ok {
-			return i * int64(e)
-		}
+		// Explicit edges are a varying dimension even when uniform
+		// (zarr-python 3.4.1; earlier releases read them as a fixed size).
 		if i <= 0 {
 			return 0
 		}

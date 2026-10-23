@@ -726,6 +726,7 @@ func metadataSeeds() [][]byte {
 		{Shape: []uint64{4}, DataType: "complex64", FillValue: complex(1, -1)},
 		{Shape: []uint64{4}, DataType: "float64", FillValue: "NaN", ChunkKeyEncoding: ChunkKeyEncoding{Name: "v2", Separator: "/"}},
 		{ZarrFormat: 2, Shape: []uint64{4}, Type: Struct(StructField{Name: "a", Type: MustDataType("int8")}, StructField{Name: "b", Type: RawBytes(2)})},
+		{Shape: []uint64{4, 3}, ChunkShape: []uint64{2, 2}, DataType: "int8", ChunkKeyEncoding: ChunkKeyEncoding{Name: "template", Template: "k/{-1}_{*:03}", Separator: "."}},
 	})
 	for _, spec := range specs {
 		docs, err := spec.Documents()
@@ -738,6 +739,14 @@ func metadataSeeds() [][]byte {
 			}
 		}
 	}
+	// Invalid documents the repairs read, and group extra fields.
+	out = append(out,
+		[]byte(v2ArrayDoc(`[6]`, `[false]`)),
+		[]byte(v3ArrayDoc(`[4, 20]`, regularGridJSON(`[2, [5.0, 10, 5]]`), `[{"name": "bytes"}]`)),
+		[]byte(v3ArrayDoc(`[9]`, regularGridJSON(`[0]`), sharded3(`[true]`))),
+		[]byte(v3ArrayDoc(`[6]`, `{"name": "rectilinear", "configuration": {"kind": "inline", "chunk_shapes": [[[2.0, 2], true, 1]]}}`, `[{"name": "bytes"}]`)),
+		[]byte(`{"ext": {"must_understand": false}, "zarr_format": 3, "node_type": "group", "attributes": {}}`),
+	)
 	// Groups, with consolidated metadata.
 	ctx := context.Background()
 	for _, format := range []int{2, 3} {
@@ -838,6 +847,32 @@ func FuzzParseMetadata(f *testing.F) {
 		})
 		if n > 256<<20 {
 			t.Fatalf("%d MiB allocated", n>>20)
+		}
+	})
+}
+
+// FuzzChunkKeyTemplate checks template chunk key encodings: parsing any
+// template fails cleanly or gives keys for every chunk of the arrays it
+// suits, which parse back to their coordinates.
+func FuzzChunkKeyTemplate(f *testing.F) {
+	for _, ex := range templateExamples {
+		f.Add(ex.template, ex.separator, uint64(11), uint64(22), uint64(33))
+	}
+	f.Add("{1:020}-{0}_{*:05}", "/", uint64(0), uint64(1<<63), uint64(7))
+	f.Fuzz(func(t *testing.T, template, sep string, a, b, c uint64) {
+		coords := []uint64{a, b, c}
+		for nd := 0; nd <= len(coords); nd++ {
+			e := ChunkKeyEncoding{Name: "template", Template: template, Separator: sep}
+			if e.check(nd) != nil {
+				continue
+			}
+			key := e.Key(coords[:nd])
+			if key == "" {
+				t.Fatalf("%q (%q): no key for %v", template, sep, coords[:nd])
+			}
+			if got, ok := e.Parse(key, nd); ok && e.Key(got) != key {
+				t.Fatalf("%q: %q parsed as %v", template, key, got)
+			}
 		}
 	})
 }

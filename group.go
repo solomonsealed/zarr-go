@@ -40,6 +40,9 @@ type Group struct {
 	attrs  map[string]any
 	raw    any        // ordered attributes
 	doc    jsonObject // v3 zarr.json
+	// extra holds the extra fields of a v3 group (objects with
+	// "must_understand": false), kept and written back unchanged.
+	extra jsonObject
 	// consolidated maps member paths (relative to the group) to their
 	// metadata, when the group has consolidated metadata.
 	consolidated map[string]consolidatedEntry
@@ -189,6 +192,9 @@ func groupFromDocs(ctx context.Context, store Store, p string, n *nodeDocs, opts
 			return nil, fmt.Errorf("zarr: group %q: %w", p, err)
 		}
 		g.doc, _ = o.(jsonObject)
+		if g.extra, err = groupExtraFields(g.doc); err != nil {
+			return nil, fmt.Errorf("zarr: group %q: %w", p, err)
+		}
 		var raw struct {
 			Attributes   json.RawMessage `json:"attributes"`
 			Consolidated *struct {
@@ -422,11 +428,44 @@ func groupDocs(format int, attrs any) (map[string][]byte, error) {
 		}
 		return map[string][]byte{".zgroup": zg, ".zattrs": za}, nil
 	}
-	doc, err := marshalPython(jsonObject{{"attributes", attrs}, {"zarr_format", 3}, {"node_type", "group"}}, 2)
+	doc, err := marshalPython(groupDocument(attrs, nil, nil), 2)
 	if err != nil {
 		return nil, err
 	}
 	return map[string][]byte{"zarr.json": doc}, nil
+}
+
+// groupDocument is a Zarr v3 group's zarr.json as zarr-python writes it:
+// attributes, zarr_format, consolidated_metadata (if any), node_type, then
+// the extra fields.
+func groupDocument(attrs, consolidated any, extra jsonObject) jsonObject {
+	doc := jsonObject{{"attributes", attrs}, {"zarr_format", 3}}
+	if consolidated != nil {
+		doc = append(doc, jsonMember{"consolidated_metadata", consolidated})
+	}
+	doc = append(doc, jsonMember{"node_type", "group"})
+	return append(doc, extra...)
+}
+
+// groupExtraFields returns the extra fields of a Zarr v3 group document.
+// The specification allows only objects with "must_understand": false;
+// others are refused, as zarr-python (3.4.1) and arrays here refuse them.
+func groupExtraFields(doc jsonObject) (jsonObject, error) {
+	var extra jsonObject
+	for _, mem := range doc {
+		switch mem.Key {
+		case "zarr_format", "node_type", "attributes", "consolidated_metadata":
+			continue
+		}
+		if obj, ok := mem.Value.(jsonObject); ok {
+			if mu, _ := obj.get("must_understand"); mu == false {
+				extra = append(extra, mem)
+				continue
+			}
+		}
+		return nil, fmt.Errorf("%w: group metadata field %q", ErrUnsupported, mem.Key)
+	}
+	return extra, nil
 }
 
 // CreateGroup creates a group at path (and any missing parent groups).
@@ -439,11 +478,13 @@ func CreateGroup(ctx context.Context, store WritableStore, p string, spec GroupS
 	if format == 0 {
 		format = 3
 	}
-	if err := prepareNode(ctx, store, p, format, opts); err != nil {
-		return nil, err
-	}
+	// Rendered before anything is deleted, so a group that cannot be
+	// stored leaves an existing node intact (as zarr-python 3.4.1 does).
 	docs, err := groupDocs(format, attrsJSON(spec.Attributes))
 	if err != nil {
+		return nil, err
+	}
+	if err := prepareNode(ctx, store, p, format, opts); err != nil {
 		return nil, err
 	}
 	if err := setDocs(ctx, store, p, docs); err != nil {
@@ -513,8 +554,8 @@ func (g *Group) SetAttributes(ctx context.Context, attrs map[string]any) error {
 	var docs map[string][]byte
 	var err error
 	if g.format == 3 {
-		doc := slices.Clone(g.doc)
-		doc.set("attributes", raw)
+		cm, _ := g.doc.get("consolidated_metadata")
+		doc := groupDocument(raw, cm, g.extra)
 		b, err := marshalPython(doc, 2)
 		if err != nil {
 			return err
@@ -550,6 +591,7 @@ func (a *Array) SetAttributes(ctx context.Context, attrs map[string]any) error {
 	if err := writeMetadata(ctx, ws, a.path, &m); err != nil {
 		return err
 	}
+	m.stored = nil // the repair, if any, is stored
 	*a.meta = m
 	return nil
 }
@@ -702,14 +744,12 @@ func ConsolidateMetadata(ctx context.Context, store WritableStore, p string) (*G
 		for _, e := range entries {
 			switch node := e.node.(type) {
 			case *Array:
-				meta = append(meta, jsonMember{e.rel, node.meta.doc})
+				meta = append(meta, jsonMember{e.rel, consolidatedArrayDoc(node)})
 			case *Group:
-				meta = append(meta, jsonMember{e.rel, jsonObject{{"attributes", groupAttrs(node)}, {"zarr_format", 3}, {"consolidated_metadata", emptyConsolidated}, {"node_type", "group"}}})
+				meta = append(meta, jsonMember{e.rel, groupDocument(groupAttrs(node), emptyConsolidated, node.extra)})
 			}
 		}
-		doc := jsonObject{{"attributes", groupAttrs(root)}, {"zarr_format", 3},
-			{"consolidated_metadata", jsonObject{{"kind", "inline"}, {"must_understand", false}, {"metadata", meta}}},
-			{"node_type", "group"}}
+		doc := groupDocument(groupAttrs(root), jsonObject{{"kind", "inline"}, {"must_understand", false}, {"metadata", meta}}, root.extra)
 		b, err := marshalPython(doc, 2)
 		if err != nil {
 			return nil, err
@@ -722,7 +762,7 @@ func ConsolidateMetadata(ctx context.Context, store WritableStore, p string) (*G
 		for _, e := range entries {
 			switch node := e.node.(type) {
 			case *Array:
-				meta = append(meta, jsonMember{e.rel + "/.zattrs", arrayAttrs(node)}, jsonMember{e.rel + "/.zarray", node.meta.doc})
+				meta = append(meta, jsonMember{e.rel + "/.zattrs", arrayAttrs(node)}, jsonMember{e.rel + "/.zarray", consolidatedArrayDoc(node)})
 			case *Group:
 				meta = append(meta, jsonMember{e.rel + "/.zattrs", groupAttrs(node)},
 					jsonMember{e.rel + "/.zgroup", jsonObject{{"zarr_format", 2}, {"consolidated_metadata", jsonObject{{"metadata", jsonObject{}}, {"must_understand", false}, {"kind", "inline"}}}}})
@@ -741,6 +781,17 @@ func ConsolidateMetadata(ctx context.Context, store WritableStore, p string) (*G
 		}
 	}
 	return OpenGroup(ctx, store, p, nil)
+}
+
+// consolidatedArrayDoc is an array's document in consolidated metadata:
+// as stored if reading it needed a repair that moves chunks, so that
+// readers of the consolidated metadata repair it again (as zarr-python
+// does), else as the array writes it.
+func consolidatedArrayDoc(a *Array) jsonObject {
+	if a.meta.stored != nil {
+		return a.meta.stored
+	}
+	return a.meta.doc
 }
 
 func groupAttrs(g *Group) any {

@@ -226,7 +226,8 @@ func parseDataType(raw json.RawMessage) (DataType, error) {
 		if name == "numpy.timedelta64" {
 			d.Kind = KindTimedelta
 		}
-		d.Unit, _ = cfg["unit"].(string)
+		unit, _ := cfg["unit"].(string)
+		d.Unit = timeUnit(unit)
 		if d.Unit == "" {
 			return d, fmt.Errorf("zarr: data type %s needs configuration.unit", name)
 		}
@@ -328,6 +329,15 @@ func (d *DataType) parseStructFields(raw json.RawMessage) error {
 	return nil
 }
 
+// timeUnit spells the microsecond unit as NumPy does ("us"; "μs" is
+// accepted as input), as zarr-python 3.4.1 does.
+func timeUnit(u string) string {
+	if u == "μs" {
+		return "us"
+	}
+	return u
+}
+
 func validTimeUnit(u string) bool {
 	switch u {
 	case "Y", "M", "W", "D", "h", "m", "s", "ms", "us", "μs", "ns", "ps", "fs", "as", "generic":
@@ -360,12 +370,12 @@ func (d DataType) Field(name string) (StructField, bool) {
 
 // Datetime64 returns numpy.datetime64 with the given unit ("s", "ns", "D", ...).
 func Datetime64(unit string, scaleFactor int) DataType {
-	return DataType{Name: "numpy.datetime64", Kind: KindDatetime, Size: 8, Unit: unit, ScaleFactor: max(scaleFactor, 1)}
+	return DataType{Name: "numpy.datetime64", Kind: KindDatetime, Size: 8, Unit: timeUnit(unit), ScaleFactor: max(scaleFactor, 1)}
 }
 
 // Timedelta64 returns numpy.timedelta64 with the given unit.
 func Timedelta64(unit string, scaleFactor int) DataType {
-	return DataType{Name: "numpy.timedelta64", Kind: KindTimedelta, Size: 8, Unit: unit, ScaleFactor: max(scaleFactor, 1)}
+	return DataType{Name: "numpy.timedelta64", Kind: KindTimedelta, Size: 8, Unit: timeUnit(unit), ScaleFactor: max(scaleFactor, 1)}
 }
 
 // FixedLengthUTF32 returns numpy's fixed-length unicode type ("U<n>") of n characters.
@@ -397,7 +407,7 @@ func MustDataType(name string) DataType {
 func (d DataType) v3JSON() any {
 	switch d.Kind {
 	case KindDatetime, KindTimedelta:
-		return jsonObject{{"name", d.Name}, {"configuration", jsonObject{{"unit", d.Unit}, {"scale_factor", d.ScaleFactor}}}}
+		return jsonObject{{"name", d.Name}, {"configuration", jsonObject{{"unit", timeUnit(d.Unit)}, {"scale_factor", d.ScaleFactor}}}}
 	case KindFixedString, KindFixedBytes:
 		return jsonObject{{"name", d.Name}, {"configuration", jsonObject{{"length_bytes", d.Size}}}}
 	case KindStruct:
@@ -573,14 +583,19 @@ func (d DataType) v2JSON(bigEndian bool) (any, error) {
 		if d.Kind == KindTimedelta {
 			code = "m"
 		}
-		if d.Unit == "generic" {
-			return fmt.Sprintf("%s%s8", order, code), nil
-		}
 		scale := ""
 		if d.ScaleFactor > 1 {
 			scale = strconv.Itoa(d.ScaleFactor)
 		}
-		return fmt.Sprintf("%s%s8[%s%s]", order, code, scale, d.Unit), nil
+		if d.Unit == "generic" {
+			// NumPy's dtype.str drops a generic unit's scale factor, so
+			// zarr-python (3.4.1) spells a scaled one out: "<M8[2generic]".
+			if scale == "" {
+				return fmt.Sprintf("%s%s8", order, code), nil
+			}
+			return fmt.Sprintf("%s%s8[%sgeneric]", order, code, scale), nil
+		}
+		return fmt.Sprintf("%s%s8[%s%s]", order, code, scale, timeUnit(d.Unit)), nil
 	case KindFixedString:
 		return fmt.Sprintf("%sU%d", order, d.Size/4), nil
 	case KindFixedBytes:

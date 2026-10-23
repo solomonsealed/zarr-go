@@ -56,11 +56,19 @@ def is_variable(dt: np.dtype) -> bool:
     return dt.kind in "OT"
 
 
+def unwrap(x):
+    """The element of nested 0-d arrays (zarr-python returns a single
+    variable-length bytes element wrapped in two or three of them)."""
+    while isinstance(x, np.ndarray):
+        x = x[()]
+    return x
+
+
 def to_wire(arr, as_bytes=None) -> dict:
     arr = np.asarray(arr)
     out = {"shape": list(arr.shape)}
     if is_variable(arr.dtype):
-        flat = [x[()] if isinstance(x, np.ndarray) else x for x in arr.reshape(-1)]
+        flat = [unwrap(x) for x in arr.reshape(-1)]
         if as_bytes is None:
             as_bytes = any(isinstance(x, (bytes, bytearray, memoryview)) for x in flat)
         if as_bytes:
@@ -68,9 +76,13 @@ def to_wire(arr, as_bytes=None) -> dict:
         else:
             out["strings"] = [str(x) for x in flat]
         return out
+    if arr.dtype.kind in "mM":
+        # astype between generic time types keeps the byte order (NumPy),
+        # so convert the counts.
+        a = np.ascontiguousarray(arr.view(arr.dtype.str[0] + "i8").astype("<i8"))
+        out["data"] = b64(a.tobytes())
+        return out
     a = np.ascontiguousarray(arr.astype(le(arr.dtype), copy=False))
-    if a.dtype.kind in "mM":
-        a = a.view("<i8")
     out["data"] = b64(a.tobytes())
     return out
 
@@ -93,6 +105,8 @@ def from_wire(w: dict, dt: np.dtype):
             return np.empty(shape, dtype=object)
         raise ValueError("no data")
     raw = unb64(w["data"])
+    if dt.kind in "mM":  # see to_wire
+        return np.frombuffer(raw, dtype="<i8").astype(dt.str[0] + "i8").view(dt).reshape(shape)
     a = np.frombuffer(raw, dtype=le(dt)).reshape(shape)
     return a.astype(dt)
 
@@ -183,12 +197,19 @@ def op_versions(req):
         cv = version("cast-value-rs")
     except Exception:
         cv = None
+    try:
+        from importlib.metadata import version
+
+        zt = version("zarr-template")
+    except Exception:
+        zt = None
     return {
         "zarr": zarr.__version__,
         "numcodecs": numcodecs.__version__,
         "numpy": np.__version__,
         "ml_dtypes": ml_dtypes.__version__,
         "cast_value_rs": cv,
+        "zarr_template": zt,
         "python": sys.version.split()[0],
     }
 
@@ -315,6 +336,28 @@ def op_consolidate(req):
     return {}
 
 
+def open_node(req, mode):
+    return zarr.open(LocalStore(req["store"]), path=req.get("path", ""), mode=mode)
+
+
+def op_documents(req):
+    """The documents zarr-python would store for the node it reads at path,
+    and whether its metadata awaits a repair that moves chunks."""
+    from zarr.core.buffer import default_buffer_prototype
+
+    node = open_node(req, "r")
+    docs = node.metadata.to_buffer_dict(default_buffer_prototype())
+    return {
+        "documents": {k: b64(v.to_bytes()) for k, v in docs.items()},
+        "repair_pending": getattr(node.metadata, "_stored_document", None) is not None,
+    }
+
+
+def op_update_attributes(req):
+    open_node(req, "r+").update_attributes(req["attributes"])
+    return {}
+
+
 def op_members(req):
     g = zarr.open_group(LocalStore(req["store"]), path=req.get("path") or None, mode="r", use_consolidated=req.get("use_consolidated"))
     out = {}
@@ -404,11 +447,31 @@ def op_known_issue(req):
             return {"occurs": False}
         except TypeError as e:
             return {"occurs": True, "detail": str(e)}
-    if name == "vlen_bytes_single_read":
-        a = zarr.create_array(store, name="a", shape=(2,), chunks=(2,), dtype=VariableLengthBytes())
-        a[:] = np.array([b"a\x00", b"b"], dtype=object)
-        v = a.get_basic_selection(0).item()
-        return {"occurs": v != b"a\x00", "detail": repr(v)}
+    if name == "vlen_bytes_nested":
+        a = zarr.create_array(store, name="a", shape=(2,), chunks=(1,), shards=(2,), dtype=VariableLengthBytes(), compressors=None)
+        v = np.empty(2, dtype=object)
+        v[0], v[1] = b"a", b"b"
+        a[:] = v
+        r, depth = a.get_orthogonal_selection((0,)), 0
+        while isinstance(r, np.ndarray):
+            r, depth = r[()], depth + 1
+        return {"occurs": depth > 1, "detail": f"{depth} nested 0-d arrays"}
+    if name == "generic_time_big_endian":
+        # Chunks holding only the fill value (NaT) are stored, not deleted.
+        a = zarr.create_array(store, name="a", shape=(4,), chunks=(2,), dtype=np.dtype(">m8[2generic]"), zarr_format=2, compressors=None, fill_value=None)
+        a[:] = np.array([1, 2, -(2**63), -(2**63)], dtype=">i8").view(">m8[2generic]")
+        stored = sorted(k for k in os.listdir(os.path.join(req["store"], "a")) if not k.startswith("."))
+        return {"occurs": "1" in stored, "detail": f"chunks stored: {stored}"}
+    if name == "template_dimensions":
+        # A template must name every coordinate once; "{0}" on a 2-d array
+        # gives chunks in the same row the same key.
+        a = zarr.create_array(store, name="a", shape=(2, 4), chunks=(1, 2), dtype="i1", compressors=None, chunk_key_encoding={"name": "template", "configuration": {"format": "{0}"}})
+        try:
+            a[:] = np.arange(8, dtype="i1").reshape(2, 4)
+        except ValueError:
+            return {"occurs": False}
+        got = a[:]
+        return {"occurs": True, "detail": str(got.ravel().tolist())}
     if name == "quantize_astype":
         from zarr.codecs.numcodecs import Quantize
 

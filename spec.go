@@ -337,6 +337,9 @@ func (s ArraySpec) build() (*Metadata, error) {
 		kenc.Name = "default"
 	}
 	kenc.Separator = kenc.separator()
+	if err := kenc.check(len(shape)); err != nil {
+		return nil, err
+	}
 	doc := jsonObject{
 		{"shape", shape},
 		{"data_type", dt.v3JSON()},
@@ -380,6 +383,9 @@ func (s ArraySpec) buildV2(dt DataType, big bool, shape, chunks []uint64, fill f
 	}
 	if s.ShardShape != nil || s.DimensionNames != nil || s.Serializer != nil || s.Codecs != nil || s.ChunkEdges != nil {
 		return nil, fmt.Errorf("zarr: shards, dimension names, serializers, codec lists and rectilinear grids need Zarr v3")
+	}
+	if s.ChunkKeyEncoding.Name == "template" {
+		return nil, fmt.Errorf("zarr: the template chunk key encoding needs Zarr v3")
 	}
 	dtJSON, err := dt.v2JSON(big)
 	if err != nil {

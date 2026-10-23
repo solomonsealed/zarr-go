@@ -162,12 +162,13 @@ func (c Case) goSpec() (zarr.ArraySpec, error) {
 			Name          string `json:"name"`
 			Configuration struct {
 				Separator string `json:"separator"`
+				Format    string `json:"format"`
 			} `json:"configuration"`
 		}
 		if err := json.Unmarshal(c.ChunkKeyEncoding, &e); err != nil {
 			return s, err
 		}
-		s.ChunkKeyEncoding = zarr.ChunkKeyEncoding{Name: e.Name, Separator: e.Configuration.Separator}
+		s.ChunkKeyEncoding = zarr.ChunkKeyEncoding{Name: e.Name, Separator: e.Configuration.Separator, Template: e.Configuration.Format}
 	}
 	return s, nil
 }
@@ -496,12 +497,6 @@ func (h *harness) read(sel selection) {
 	p, err := fromWire(pw, h.dt)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if h.dt.Kind == zarr.KindBytes && len(g.Shape) == 0 {
-		// zarr-python 3.4 returns single bytes elements as NumPy bytes_,
-		// which drop trailing NULs (TestKnownPythonIssues).
-		g = g.Clone()
-		g.Strings[0] = strings.TrimRight(g.Strings[0], "\x00")
 	}
 	h.report.Comparisons++
 	if err := sameArray(p, g); err != nil {

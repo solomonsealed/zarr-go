@@ -3,8 +3,10 @@ package zarr
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 )
 
@@ -152,11 +154,102 @@ func (a *Array) writeTasks(ctx context.Context, tasks []chunkTask, data *NDArray
 	if len(tasks) == 0 {
 		return nil
 	}
+	if err := a.storeRepair(ctx); err != nil {
+		return err
+	}
 	p := newPool(ctx, a.concurrency)
 	for _, t := range tasks {
 		p.do(func() error { return a.writeChunk(p.ctx, w, t, data, dataStrides) })
 	}
 	return p.wait()
+}
+
+// storeRepair stores the repaired metadata of an array read from a stored
+// document whose repair moves chunks (see Metadata.RepairPending), before
+// chunks are written under it, as zarr-python does. The stored document is
+// read again, since another writer may have replaced it: if that one lays
+// out chunks differently, the write fails and nothing is stored; if it
+// needs no repair, it is kept.
+func (a *Array) storeRepair(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.meta.stored == nil {
+		return nil
+	}
+	ws, ok := a.store.(WritableStore)
+	if !ok {
+		return nil // NewArray: the caller stores the metadata
+	}
+	names := []string{"zarr.json"}
+	if a.meta.ZarrFormat == 2 {
+		names = []string{".zarray", ".zattrs"}
+	}
+	stored := map[string][]byte{}
+	for _, n := range names {
+		b, ok, err := a.store.Get(ctx, joinKey(a.path, n), ByteRange{})
+		if err != nil {
+			return err
+		}
+		if ok {
+			stored[n] = b
+		}
+	}
+	if doc, ok := stored[names[0]]; ok {
+		var cur *Metadata
+		var err error
+		if a.meta.ZarrFormat == 2 {
+			cur, err = ParseMetadataV2(doc, stored[".zattrs"])
+		} else {
+			cur, err = parseV3Metadata(doc)
+		}
+		if err != nil {
+			return fmt.Errorf("zarr: array %q: %w", a.path, err)
+		}
+		if chunkLayout(cur) != chunkLayout(a.meta) {
+			return fmt.Errorf("zarr: array %q: the metadata stored has changed since the array was opened; reopen the array to write to it (nothing was stored)", a.path)
+		}
+		if cur.stored != nil {
+			docs, err := cur.documents()
+			if err != nil {
+				return err
+			}
+			for n, b := range docs {
+				if old, ok := stored[n]; ok && sameJSON(old, b) {
+					delete(docs, n)
+				}
+			}
+			if err := setDocs(ctx, ws, a.path, docs); err != nil {
+				return err
+			}
+		}
+	}
+	a.meta.stored = nil
+	return nil
+}
+
+// chunkLayout describes how an array's chunks are laid out: its chunk grid
+// and, if sharded, the inner chunk shape.
+func chunkLayout(m *Metadata) string {
+	g, _ := marshalPython(m.grid.json(), -1)
+	for _, c := range m.Codecs {
+		if c.Name == "sharding_indexed" {
+			var cfg struct {
+				ChunkShape json.RawMessage `json:"chunk_shape"`
+			}
+			json.Unmarshal(c.Configuration, &cfg)
+			return string(g) + " " + string(cfg.ChunkShape)
+		}
+	}
+	return string(g)
+}
+
+// sameJSON reports whether two JSON documents hold the same value.
+func sameJSON(a, b []byte) bool {
+	var x, y any
+	if json.Unmarshal(pyCompat(a), &x) != nil || json.Unmarshal(pyCompat(b), &y) != nil {
+		return false
+	}
+	return reflect.DeepEqual(x, y)
 }
 
 func (a *Array) writeChunk(ctx context.Context, w ChunkWriter, t chunkTask, data *NDArray, dataStrides []uint64) error {
@@ -172,6 +265,9 @@ func (a *Array) writeChunk(ctx context.Context, w ChunkWriter, t chunkTask, data
 			}
 			if ok {
 				existing = raw
+				if existing == nil {
+					existing = []byte{} // stored but empty: truncated, not missing
+				}
 			}
 		}
 		shard, err := sc.writePartial(ctx, existing, spec, t.proj, data, dataStrides)
@@ -328,6 +424,12 @@ func (a *Array) Resize(ctx context.Context, shape []uint64) error {
 	newMeta.doc = slices.Clone(a.meta.doc)
 	newMeta.setShape(shape)
 	newGrid := newMeta.GridShape()
+	// Encoded before any chunk is deleted, as zarr-python does: metadata
+	// that cannot be stored then fails with the store untouched.
+	docs, err := newMeta.documents()
+	if err != nil {
+		return err
+	}
 	shrinks := false
 	for d := range oldGrid {
 		if newGrid[d] < oldGrid[d] {
@@ -350,9 +452,10 @@ func (a *Array) Resize(ctx context.Context, shape []uint64) error {
 			return err
 		}
 	}
-	if err := writeMetadata(ctx, ws, a.path, &newMeta); err != nil {
+	if err := setDocs(ctx, ws, a.path, docs); err != nil {
 		return err
 	}
+	newMeta.stored = nil // the repair, if any, is stored
 	*a.meta = newMeta
 	return nil
 }
