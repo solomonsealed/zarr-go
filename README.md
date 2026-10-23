@@ -173,9 +173,10 @@ Icechunk repositories.
 
 ## License
 
-MIT; see [LICENSE](LICENSE). The Blosc, LZ4 and bzip2 compressors are ports
-of C code and keep their original BSD and MIT licenses, in a `LICENSE` file in
-each package: [internal/blosc](internal/blosc/LICENSE),
+MIT; see [LICENSE](LICENSE), which also holds the licenses of zarr-python and
+numcodecs, as parts of zarr-go are ported from them. The Blosc, LZ4 and bzip2
+compressors are ports of C code and keep their original BSD and MIT licenses,
+in a `LICENSE` file in each package: [internal/blosc](internal/blosc/LICENSE),
 [internal/lz4](internal/lz4/LICENSE) and
 [internal/bzip2](internal/bzip2/LICENSE). The xz delta and BCJ filters are
 ported from liblzma, which is public domain (0BSD since XZ Utils 5.6).
